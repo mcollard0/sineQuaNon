@@ -1,3 +1,14 @@
+' MultiValueSearchAndReplace.bas / vba / xlsm
+'
+' This script accepts multiple values in a A$:B$ range and replaces them in a given search range. So for example, you can replace a column of car colors with normalized values such as BLUE->1, RED->2. The manner is case insensitive. 
+'
+' Application: this is commonly used for importing customer-sourced data in Excel to a database. 
+'
+'
+' This VBA script was part of a specified domain knowledge spreadsheet at one time. AS non-germaine here, it's been removed.
+'
+'
+'
 
 Dim OpenBook As Workbook
 Public Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal Milliseconds As LongPtr)
