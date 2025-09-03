@@ -288,7 +288,25 @@ Remove-Item $scriptPath
 Write-Host ""
 Write-Host "Bootable USB creation complete!" -ForegroundColor Green
 
+# Sync and safely eject the USB drive
+Write-Host ""
+Write-Host "Syncing data to USB drive..." -ForegroundColor Yellow
+try {
+    # Force sync to ensure all data is written
+    sync
+    Start-Sleep -Seconds 2
+    
+    # Attempt to safely eject the USB drive
+    Write-Host "Safely ejecting USB drive..." -ForegroundColor Yellow
+    (New-Object -comObject Shell.Application).Namespace(17).ParseName($selectedDrive.DriveLetterWithColon).InvokeVerb('Eject')
+    Start-Sleep -Seconds 1
+    
+    Write-Host "✓ USB drive has been safely ejected!" -ForegroundColor Green
+} catch {
+    Write-Host "Note: Please manually eject the USB drive using Windows 'Safely Remove Hardware'" -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host "Bootable USB creation process completed!" -ForegroundColor Green
 Write-Host "USB Drive: $($selectedDrive.DriveLetterWithColon) ($($selectedDrive.FriendlyName)) is now bootable!" -ForegroundColor Green
-Write-Host "You can now safely eject the USB drive and use it to boot Ubuntu." -ForegroundColor Cyan
+Write-Host "You can now use it to boot Ubuntu." -ForegroundColor Cyan
