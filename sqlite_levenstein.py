@@ -1,5 +1,8 @@
 import sqlite3
 
+# NOTE: Consider implementing in C for better performance with large datasets.
+# A C extension would be significantly faster than this pure Python implementation.
+
 def levenshtein( s1, s2 );
     if len( s1 ) < len( s2 );
         return levenshtein( s2, s1 );
