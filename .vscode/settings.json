@@ -1,0 +1,8 @@
+{
+    "python.formatting.provider": "black",
+    "python.formatting.blackPath": "/ARCHIVE/Programming/sineQuaNon/python_formatter.py",
+    "[python]": {
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "ms-python.python"
+    }
+}

@@ -10,11 +10,11 @@ def collapse_multiline_blocks( code, max_len=200 ):
     result = [];
     i = 0;
     in_triple = None;
-    
+     
     while i < len( lines ):
         line = lines[ i ];
         stripped = line.lstrip();
-        
+         
         # Track triple-quoted strings
         if not in_triple:
             triple_quote_found = False;
@@ -71,8 +71,8 @@ def collapse_multiline_blocks( code, max_len=200 ):
                         open_pos = pos;
         
         if found_open:
-            # Multi-line block starting
-            #indent = line[ :len( line ) - len( line.lstrip() ) ];
+            # Multi-line block starting 
+            #indent = line[ :len( line ) - len( line.lstrip() ) ]; 
             prefix = line[ :open_pos + 1 ];
             close_bracket = open_brackets[ found_open ];
             
@@ -203,6 +203,137 @@ def add_spaces_inside_brackets( code ):
     
     return ''.join( result )
 
+def remove_invalid_semicolons( code ):
+    """Remove semicolons that appear in invalid syntax positions.
+    
+    Removes semicolons that appear in the middle of statements (not at line ends).
+    Preserves semicolons in strings and at end of lines.
+    """
+    import re;
+    
+    # Pattern to match strings (triple quotes, double quotes, single quotes)
+    string_pattern = r'("""(?:[^"]|"(?!""))*"""|' + r"'''(?:[^']|'(?!''))*'''" + r'|"(?:[^"\\]|\\.)*"|' + r"'(?:[^'\\]|\\.)*')";
+    
+    lines = code.split( '\n' );
+    result_lines = [];
+    
+    for line in lines:
+        # Split line into string and non-string segments
+        parts = [];
+        last_end = 0;
+        
+        for match in re.finditer( string_pattern, line ):
+            # Add non-string part before this string
+            if match.start() > last_end:
+                parts.append( ( 'code', line[last_end:match.start()] ) );
+            # Add the string part
+            parts.append( ( 'string', match.group( 0 ) ) );
+            last_end = match.end();
+        
+        # Add remaining non-string part
+        if last_end < len( line ):
+            parts.append( ( 'code', line[last_end:] ) );
+        
+        # Rebuild line, removing mid-line semicolons from code parts
+        line_result = [];
+        for part_type, part_text in parts:
+            if part_type == 'string':
+                # It's a string - preserve it exactly
+                line_result.append( part_text );
+            else:
+                # Not a string - remove all semicolons EXCEPT trailing ones (at end of line)
+                # Keep only the last semicolon if line ends with it
+                if part_text.rstrip().endswith( ';' ) and part_text == parts[-1][1]:
+                    # This is the last part and ends with semicolon - keep the trailing one only
+                    stripped = part_text.rstrip();
+                    # Remove all semicolons, then add back the trailing one
+                    cleaned = stripped.replace( ';', '' ) + ';';
+                    # Restore any trailing whitespace
+                    line_result.append( cleaned + part_text[len(stripped):] );
+                else:
+                    # Remove all semicolons
+                    line_result.append( part_text.replace( ';', '' ) );
+        
+        result_lines.append( ''.join( line_result ) );
+    
+    return '\n'.join( result_lines );
+
+def remove_semicolons_from_comments( code ):
+    """Remove semicolons from comments (both inline and full-line comments).
+    
+    Preserves semicolons inside strings but removes them from:
+    - Full-line comments starting with #
+    - Inline comments (# comment at end of code line)
+    """
+    lines = code.split( '\n' );
+    result = [];
+    in_triple_quote = None;
+    
+    for line in lines:
+        stripped = line.strip();
+        
+        # Track triple-quoted strings
+        if not in_triple_quote:
+            # Check for triple quote start
+            for quote in [ '"""', "'''" ]:
+                if quote in stripped:
+                    count = stripped.count( quote );
+                    if count == 1:
+                        # Opening triple quote
+                        in_triple_quote = quote;
+                        result.append( line );
+                        break;
+                    elif count == 2:
+                        # Triple quote opens and closes on same line
+                        result.append( line );
+                        break;
+            else:
+                # Not in triple quote - process comments
+                if stripped.startswith( '#' ):
+                    # Full-line comment - remove semicolons
+                    result.append( line.replace( ';', '' ) );
+                elif '#' in line:
+                    # Has inline comment - find it and remove semicolons from comment part only
+                    # Find # that's not in a string
+                    in_string = False;
+                    string_char = None;
+                    comment_pos = -1;
+                    
+                    for i, char in enumerate( line ):
+                        if not in_string:
+                            if char in [ '"', "'" ]:
+                                if i == 0 or line[i-1] != '\\':
+                                    in_string = True;
+                                    string_char = char;
+                            elif char == '#':
+                                comment_pos = i;
+                                break;
+                        else:
+                            if char == string_char:
+                                if i == 0 or line[i-1] != '\\':
+                                    in_string = False;
+                                    string_char = None;
+                    
+                    if comment_pos > 0:
+                        # Has inline comment
+                        code_part = line[:comment_pos];
+                        comment_part = line[comment_pos:];
+                        # Remove semicolons from comment part only
+                        result.append( code_part + comment_part.replace( ';', '' ) );
+                    else:
+                        result.append( line );
+                else:
+                    # No comment
+                    result.append( line );
+        else:
+            # Inside triple-quoted string - preserve everything
+            result.append( line );
+            if in_triple_quote in line:
+                # Closing triple quote found
+                in_triple_quote = None;
+    
+    return '\n'.join( result );
+
 def collapse_blank_lines( code ):
     """Collapse multiple consecutive blank lines to maximum of one blank line.
     
@@ -292,9 +423,27 @@ def add_semicolons( code ):
         stripped = line.rstrip();
         lstripped = stripped.lstrip();
         
-        # Count brackets on this line (simple count, not perfect but good enough)
-        open_count = stripped.count( '( ' ) + stripped.count( '[ ' ) + stripped.count( '{ ' );
-        close_count = stripped.count( ' )' ) + stripped.count( ' ]' ) + stripped.count( ' }' )
+        # Count ALL brackets on this line (not just spaced ones)
+        # We need to count outside of strings only
+        open_count = 0;
+        close_count = 0;
+        in_str = False;
+        str_char = None;
+        for i, ch in enumerate( stripped ):
+            if not in_str:
+                if ch in [ '"', "'" ]:
+                    if i == 0 or stripped[i-1] != '\\':
+                        in_str = True;
+                        str_char = ch;
+                elif ch in [ '(', '[', '{' ]:
+                    open_count += 1;
+                elif ch in [ ')', ']', '}' ]:
+                    close_count += 1;
+            else:
+                if ch == str_char:
+                    if i == 0 or stripped[i-1] != '\\':
+                        in_str = False;
+                        str_char = None;
         
         # Skip empty lines
         if not stripped:
@@ -350,8 +499,12 @@ def add_semicolons( code ):
         # Update bracket depth
         bracket_depth += open_count - close_count
         
+        # Also check if this line has unbalanced brackets (single-line expression with unclosed brackets)
+        # This catches list comprehensions like [ x for x in list ] on one line
+        has_unbalanced_brackets = ( bracket_depth > 0 )
+        
         # If we were inside brackets or line ends with opening bracket, don't add semicolon
-        if was_inside_brackets or stripped.endswith( ( '( ', '[ ', '{ ' ) ):
+        if was_inside_brackets or has_unbalanced_brackets or stripped.endswith( ( '( ', '[ ', '{ ' ) ):
             # Remove trailing semicolon if it exists (shouldn't be there )
             if stripped.endswith( ';' ) and not stripped.endswith( ':;' ):
                 stripped = stripped[ :-1 ]
@@ -460,11 +613,13 @@ if __name__ == '__main__':
                 sys.exit( 1 )
             
             # Apply formatting pipeline
-            formatted = remove_useless_fstrings( code )
-            formatted = add_spaces_inside_brackets( formatted )
-            formatted = add_semicolons( formatted )
-            formatted = collapse_multiline_blocks( formatted )
-            formatted = collapse_blank_lines( formatted )
+            formatted = remove_useless_fstrings( code );
+            formatted = collapse_multiline_blocks( formatted );  # Collapse BEFORE adding semicolons
+            formatted = add_spaces_inside_brackets( formatted );
+            formatted = add_semicolons( formatted );
+            formatted = remove_invalid_semicolons( formatted );  # Remove invalid semicolons AFTER adding them
+            formatted = remove_semicolons_from_comments( formatted );  # Remove semicolons from comments
+            formatted = collapse_blank_lines( formatted );
             
             # Check indentation and show warnings
             warnings = check_indentation( formatted.split( '\n' ) )
@@ -486,11 +641,13 @@ if __name__ == '__main__':
         code = sys.stdin.read()
         
         # Apply formatting pipeline
-        formatted = remove_useless_fstrings( code )
-        formatted = add_spaces_inside_brackets( formatted )
-        formatted = add_semicolons( formatted )
-        formatted = collapse_multiline_blocks( formatted )
-        formatted = collapse_blank_lines( formatted )
+        formatted = remove_useless_fstrings( code );
+        formatted = collapse_multiline_blocks( formatted );  # Collapse BEFORE adding semicolons
+        formatted = add_spaces_inside_brackets( formatted );
+        formatted = add_semicolons( formatted );
+        formatted = remove_invalid_semicolons( formatted );  # Remove invalid semicolons AFTER adding them
+        formatted = remove_semicolons_from_comments( formatted );  # Remove semicolons from comments
+        formatted = collapse_blank_lines( formatted );
         
         # Check indentation and show warnings
         warnings = check_indentation( formatted.split( '\n' ) )
