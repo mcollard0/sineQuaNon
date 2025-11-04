@@ -1,0 +1,5 @@
+# Well shit. Multiple staments on one line. My god. Semi-colon on the end. All the thigns I love in one fucking place. Bare Excepts.:\n
+
+[tool.ruff.lint]
+ignore = ["E701", "E702", "E703", "E722"]
+
