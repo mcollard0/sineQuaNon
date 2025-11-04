@@ -17,19 +17,31 @@ def collapse_multiline_blocks( code, max_len=200 ):
         
         # Track triple-quoted strings
         if not in_triple:
+            triple_quote_found = False;
             for quote in [ '"""', "'''" ]:
-                if quote in stripped and stripped.count( quote ) == 1:
-                    in_triple = quote;
-                    break;
-        elif in_triple and in_triple in line:
-            in_triple = None;
+                if quote in stripped:
+                    count = stripped.count( quote );
+                    if count == 1:
+                        # Opening triple quote
+                        in_triple = quote;
+                        result.append( line );
+                        i += 1;
+                        triple_quote_found = True;
+                        break;
+                    elif count == 2:
+                        # Triple quote opens and closes on same line
+                        result.append( line );
+                        i += 1;
+                        triple_quote_found = True;
+                        break;
+            if triple_quote_found:
+                continue;
+        else:
+            # Inside triple-quoted string
             result.append( line );
-            i += 1;
-            continue;
-        
-        # Skip if in triple-quoted string
-        if in_triple:
-            result.append( line );
+            if in_triple in line:
+                # Closing triple quote found
+                in_triple = None;
             i += 1;
             continue;
         
@@ -146,17 +158,145 @@ def check_indentation( lines ):
     
     return warnings;
 
+def add_spaces_inside_brackets( code ):
+    """Add single space after opening and before closing brackets/parens/braces.
+    
+    Uses regex to avoid modifying content inside strings.
+    Example: [1,2] -> [ 1,2 ], print(x) -> print( x ), {a:b} -> { a:b }
+    """
+    import re
+    
+    # Split code into string and non-string segments
+    # This regex matches strings (single, double, triple-quoted) and captures them
+    # Order matters: check triple-quotes before single quotes
+    string_pattern = r'("""(?:[^"]|"(?!""))*"""|' + r"'''(?:[^']|'(?!''))*'''" + r'|"(?:[^"\\]|\\.)*"|' + r"'(?:[^'\\]|\\.)*')";
+    
+    def add_spaces_to_segment( text ):
+        """Add spaces to brackets in non-string text."""
+        # Add space after opening brackets if not already present
+        # (?<=[\(\[\{]) = lookbehind for opening bracket
+        # (?!\s) = not followed by whitespace
+        # (?![\)\]\}]) = not followed by closing bracket (empty brackets)
+        text = re.sub( r'(?<=[\(\[\{])(?!\s)(?![\)\]\}])', ' ', text );
+        
+        # Add space before closing brackets if not already present
+        # (?<!\s) = not preceded by whitespace
+        # (?<![\(\[\{]) = not preceded by opening bracket (empty brackets)
+        # (?=[\)\]\}]) = lookahead for closing bracket
+        text = re.sub( r'(?<!\s)(?<![\(\[\{])(?=[\)\]\}])', ' ', text );
+        
+        return text;
+    
+    # Process code: split by strings, add spaces only to non-string parts
+    parts = re.split( string_pattern, code, flags=re.DOTALL );
+    result = [];
+    
+    for i, part in enumerate( parts ):
+        if part is None:
+            continue;
+        # Odd indices are captured groups (strings), even indices are non-string code
+        if i % 2 == 0:
+            # Non-string code - add spaces
+            result.append( add_spaces_to_segment( part ) );
+        else:
+            # String literal - preserve as-is
+            result.append( part );
+    
+    return ''.join( result );
+
+def collapse_blank_lines( code ):
+    """Collapse multiple consecutive blank lines to maximum of one blank line.
+    
+    Preserves blank lines inside strings (triple-quoted), but collapses
+    excessive blank lines in regular code.
+    """
+    lines = code.split( '\n' );
+    result = [];
+    in_triple = None;
+    consecutive_blanks = 0;
+    
+    for line in lines:
+        stripped = line.strip();
+        
+        # Track triple-quoted strings
+        if not in_triple:
+            # Check for triple quote start
+            for quote in [ '"""', "'''" ]:
+                if quote in stripped:
+                    count = stripped.count( quote );
+                    if count == 1:
+                        # Opening triple quote
+                        in_triple = quote;
+                        result.append( line );
+                        consecutive_blanks = 0;
+                        break;
+                    elif count == 2:
+                        # Triple quote opens and closes on same line
+                        result.append( line );
+                        consecutive_blanks = 0;
+                        break;
+            else:
+                # Not a triple quote line
+                if not stripped:
+                    # Blank line
+                    consecutive_blanks += 1;
+                    # Only keep first blank line
+                    if consecutive_blanks == 1:
+                        result.append( line );
+                else:
+                    # Non-blank line
+                    consecutive_blanks = 0;
+                    result.append( line );
+        else:
+            # Inside triple-quoted string - preserve everything
+            result.append( line );
+            if in_triple in line:
+                # Closing triple quote found
+                in_triple = None;
+                consecutive_blanks = 0;
+    
+    return '\n'.join( result );
+
+def remove_useless_fstrings( code ):
+    """Remove f prefix from strings that don't contain placeholders {}."""
+    # Match f"..." or f'...' strings and check if they contain {}
+    import re
+    
+    def replace_fstring( match ):
+        quote_char = match.group( 1 );  # Single or double quote
+        content = match.group( 2 );     # String content
+        
+        # Check if content has placeholders
+        if '{' in content and '}' in content:
+            # Keep f-string
+            return match.group( 0 );
+        else:
+            # Remove f prefix
+            return f"{quote_char}{content}{quote_char}";
+    
+    # Pattern to match f"..." or f'...' (handling escaped quotes)
+    # Match f followed by quote, then content, then closing quote
+    pattern = r'\bf(["\'])(((?!(?<!\\)\1).)*?)\1';
+    
+    result = re.sub( pattern, replace_fstring, code );
+    return result;
+
 def add_semicolons( code ):
     """Add semicolons to every line of Python code (excluding blank lines, comments, and docstrings)."""
     lines = code.split( '\n' );
     result = [];
     in_multiline_comment = False;
     multiline_quote = None;
+    bracket_depth = 0;  # Track if we're inside brackets
 
-    for line in lines:
+    for line_idx, line in enumerate( lines ):
         stripped = line.rstrip();
         lstripped = stripped.lstrip();
-
+        
+        # Count brackets on this line (simple count, not perfect but good enough)
+        open_count = stripped.count( '(' ) + stripped.count( '[' ) + stripped.count( '{' );
+        close_count = stripped.count( ')' ) + stripped.count( ']' ) + stripped.count( '}' );
+        
         # Skip empty lines
         if not stripped:
             result.append( line );
@@ -195,10 +335,110 @@ def add_semicolons( code ):
         if stripped.endswith( ':;' ):
             stripped = stripped[:-1];
 
-        # If line already ends with punctuation, keep it
-        if stripped.endswith( ( ';', ':', ',', '.', ')', ']', '}', '\\', '{' ) ):
+        # If line ends with opening bracket, update depth and don't add semicolon
+        if stripped.endswith( ( '(', '[', '{' ) ):
+            bracket_depth += open_count - close_count;
             result.append( stripped );
             continue;
+        
+        # Remove semicolon if it appears right after opening bracket (syntax error)
+        if '(;' in stripped or '[;' in stripped or '{;' in stripped:
+            stripped = stripped.replace( '(;', '(' ).replace( '[;', '[' ).replace( '{;', '{' );
+        
+        # Check if we're currently inside brackets BEFORE updating depth
+        was_inside_brackets = bracket_depth > 0;
+        
+        # Update bracket depth
+        bracket_depth += open_count - close_count;
+        
+        # If we were inside brackets or line ends with opening bracket, don't add semicolon
+        if was_inside_brackets or stripped.endswith( ( '(', '[', '{' ) ):
+            # Remove trailing semicolon if it exists (shouldn't be there)
+            if stripped.endswith( ';' ) and not stripped.endswith( ':;' ):
+                stripped = stripped[:-1];
+            result.append( stripped );
+            continue;
+        
+        # Check if line has inline comment (code followed by #)
+        # Need to find # that's not inside a string
+        import re
+        # Match strings and find # outside of them
+        in_string = False;
+        string_char = None;
+        comment_pos = -1;
+        
+        for i, char in enumerate( stripped ):
+            if not in_string:
+                if char in [ '"', "'" ]:
+                    # Check if not escaped
+                    if i == 0 or stripped[i-1] != '\\':
+                        in_string = True;
+                        string_char = char;
+                elif char == '#':
+                    comment_pos = i;
+                    break;
+            else:
+                if char == string_char:
+                    # Check if not escaped
+                    if i == 0 or stripped[i-1] != '\\':
+                        in_string = False;
+                        string_char = None;
+        
+        if comment_pos > 0:
+            # Has inline comment - add semicolon before the comment unless it's a raise statement
+            code_part = stripped[:comment_pos].rstrip();
+            comment_part = stripped[comment_pos:];
+            
+            # Special case: never add semicolon to raise statements, even with comments
+            if code_part.lstrip().startswith( 'raise' ):
+                result.append( code_part + ' ' + comment_part );
+                continue;
+            
+            # Check if code part already ends with semicolon or other punctuation
+            if code_part.endswith( ( ';', ':', ',', '.', '\\', ' or', ' and' ) ):
+                result.append( stripped );
+            else:
+                result.append( code_part + '; ' + comment_part );
+            continue;
+        
+        # Check if line ends with control flow keywords that shouldn't have semicolons
+        # These are statements that change flow: raise, return, break, continue, pass, yield
+        control_keywords = [ 'raise', 'return', 'break', 'continue', 'pass', 'yield' ];
+        ends_with_control = False;
+        for keyword in control_keywords:
+            # Check if line ends with keyword (possibly followed by whitespace)
+            if lstripped.startswith( keyword + ' ' ) or lstripped == keyword:
+                # Make sure it's actually the keyword and not part of a larger identifier
+                # Check the code part (before any comment)
+                code_only = stripped.split( '#' )[0].rstrip();
+                if code_only.endswith( keyword ) or keyword + ' ' in code_only or keyword + '(' in code_only:
+                    ends_with_control = True;
+                    break;
+        
+        if ends_with_control:
+            result.append( stripped );
+            continue;
+        
+        # If line already ends with certain punctuation or boolean operators, keep it
+        # Note: ) ] } are NOT in this list because complete statements like print() should get semicolons
+        if stripped.endswith( ( ';', ':', ',', '.', '\\', ' or', ' and' ) ):
+            result.append( stripped );
+            continue;
+        
+        # Special case: if line ends with ) and next line is indented more, don't add semicolon
+        # (This is a function/class definition followed by a block)
+        if stripped.endswith( ')' ):
+            # Check if there's a next line
+            if line_idx + 1 < len( lines ):
+                next_line = lines[ line_idx + 1 ];
+                # Get current and next line indentation
+                current_indent = len( line ) - len( line.lstrip() );
+                next_indent = len( next_line ) - len( next_line.lstrip() );
+                # If next line is indented more (and not empty/comment), don't add semicolon
+                next_stripped = next_line.strip();
+                if next_stripped and not next_stripped.startswith( '#' ) and next_indent > current_indent:
+                    result.append( stripped );
+                    continue;
 
         # Add semicolon to code lines
         result.append( stripped + ';' );
@@ -222,8 +462,11 @@ if __name__ == '__main__':
                 sys.exit( 1 );
             
             # Apply formatting pipeline
-            code = collapse_multiline_blocks( code );
-            formatted = add_semicolons( code );
+            formatted = remove_useless_fstrings( code );
+            formatted = add_spaces_inside_brackets( formatted );
+            formatted = add_semicolons( formatted );
+            formatted = collapse_multiline_blocks( formatted );
+            formatted = collapse_blank_lines( formatted );
             
             # Check indentation and show warnings
             warnings = check_indentation( formatted.split( '\n' ) );
@@ -245,8 +488,11 @@ if __name__ == '__main__':
         code = sys.stdin.read();
         
         # Apply formatting pipeline
-        code = collapse_multiline_blocks( code );
-        formatted = add_semicolons( code );
+        formatted = remove_useless_fstrings( code );
+        formatted = add_spaces_inside_brackets( formatted );
+        formatted = add_semicolons( formatted );
+        formatted = collapse_multiline_blocks( formatted );
+        formatted = collapse_blank_lines( formatted );
         
         # Check indentation and show warnings
         warnings = check_indentation( formatted.split( '\n' ) );
