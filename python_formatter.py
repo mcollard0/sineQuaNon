@@ -206,8 +206,14 @@ def add_spaces_inside_brackets( code ):
 def remove_invalid_semicolons( code ):
     """Remove semicolons that appear in invalid syntax positions.
     
-    Removes semicolons that appear in the middle of statements (not at line ends).
-    Preserves semicolons in strings and at end of lines.
+    ONLY removes semicolons that are inside bracket expressions [],{},().
+    Preserves semicolons in strings, at end of lines, and between statements.
+    
+    Examples:
+        Valid (preserved):   x = 5; y = 10;       # Two statements
+        Valid (preserved):   response.read(); text = decode()  # Two statements
+        Invalid (removed):   [ 'a'; 'b' ]        # Inside list literal
+        Invalid (removed):   func( x; y )        # Inside function call
     """
     import re;
     
@@ -216,6 +222,7 @@ def remove_invalid_semicolons( code ):
     
     lines = code.split( '\n' );
     result_lines = [];
+    bracket_depth = 0; # Track bracket depth ACROSS LINES
     
     for line in lines:
         # Split line into string and non-string segments
@@ -234,25 +241,34 @@ def remove_invalid_semicolons( code ):
         if last_end < len( line ):
             parts.append( ( 'code', line[last_end:] ) );
         
-        # Rebuild line, removing mid-line semicolons from code parts
+        # Rebuild line, removing semicolons ONLY inside brackets
+        # Bracket depth carries across lines AND across parts within a line
         line_result = [];
+        
         for part_type, part_text in parts:
             if part_type == 'string':
                 # It's a string - preserve it exactly
                 line_result.append( part_text );
             else:
-                # Not a string - remove all semicolons EXCEPT trailing ones (at end of line)
-                # Keep only the last semicolon if line ends with it
-                if part_text.rstrip().endswith( ';' ) and part_text == parts[-1][1]:
-                    # This is the last part and ends with semicolon - keep the trailing one only
-                    stripped = part_text.rstrip();
-                    # Remove all semicolons, then add back the trailing one
-                    cleaned = stripped.replace( ';', '' ) + ';';
-                    # Restore any trailing whitespace
-                    line_result.append( cleaned + part_text[len(stripped):] );
-                else:
-                    # Remove all semicolons
-                    line_result.append( part_text.replace( ';', '' ) );
+                # Track bracket depth and remove semicolons only inside brackets
+                result = [];
+                
+                for i, char in enumerate( part_text ):
+                    if char in '([{':
+                        bracket_depth += 1;
+                        result.append( char );
+                    elif char in ')]}':
+                        bracket_depth -= 1;
+                        result.append( char );
+                    elif char == ';':
+                        # Only keep semicolon if we're NOT inside brackets
+                        if bracket_depth == 0:
+                            result.append( char );
+                        # else: skip it (remove it)
+                    else:
+                        result.append( char );
+                
+                line_result.append( ''.join( result ) );
         
         result_lines.append( ''.join( line_result ) );
     
@@ -452,15 +468,30 @@ def add_semicolons( code ):
 
         # Check for multi-line comment start/end (""" or ''' )
         if not in_multiline_comment:
-            if lstripped.startswith( '"""' ) or lstripped.startswith( "'''" ):
-                multiline_quote = lstripped[ :3 ];
-                in_multiline_comment = True;
-                result.append( line );
-                # Check if it ends on the same line
-                if stripped.count( multiline_quote ) >= 2:
-                    in_multiline_comment = False;
-                continue
+            # Check if line contains triple quotes (could be at start or after assignment)
+            for quote in [ '"""', "'''" ]:
+                if quote in stripped:
+                    # Count occurrences to determine if it opens/closes on same line
+                    count = stripped.count( quote );
+                    if count == 1:
+                        # Opening triple quote (may be standalone or at end of line like sql = """)
+                        multiline_quote = quote;
+                        in_multiline_comment = True;
+                        result.append( line );
+                        break;
+                    elif count == 2:
+                        # Triple quote opens and closes on same line (e.g., x = """text""")
+                        # Don't set in_multiline_comment, just append and add semicolon normally
+                        break;
+            else:
+                # No triple quotes found, continue to normal processing below
+                pass;
+            
+            # If we just entered a multiline comment, skip the rest of processing
+            if in_multiline_comment:
+                continue;
         else:
+            # Already inside multi-line comment - preserve everything
             result.append( line );
             if multiline_quote in stripped:
                 in_multiline_comment = False;
