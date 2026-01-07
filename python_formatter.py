@@ -1,689 +1,209 @@
 #!/usr/bin/env python3
-"""Custom Python formatter that adds semicolons and collapses short multi-line blocks."""
-import sys;
-import argparse;
-import re;
+"""
+Custom Python formatter using the `tokenize` module.
+Enforces:
+1. Spaces inside brackets/parens: [ 1, 2 ], func( a )
+2. Semicolons at end of statements (excluding pass, raise, block starters)
+Safe for strings, comments, and f-strings.
+"""
 
-def collapse_multiline_blocks( code, max_len=200 ):
-    """Collapse multi-line blocks to single lines if total length <= max_len."""
-    lines = code.split( '\n' );
-    result = [];
-    i = 0;
-    in_triple = None;
-     
-    while i < len( lines ):
-        line = lines[ i ];
-        stripped = line.lstrip();
-         
-        # Track triple-quoted strings
-        if not in_triple:
-            triple_quote_found = False;
-            for quote in [ '"""', "'''" ]:
-                if quote in stripped:
-                    count = stripped.count( quote );
-                    if count == 1:
-                        # Opening triple quote
-                        in_triple = quote;
-                        result.append( line );
-                        i += 1;
-                        triple_quote_found = True;
-                        break
-                    elif count == 2:
-                        # Triple quote opens and closes on same line
-                        result.append( line );
-                        i += 1;
-                        triple_quote_found = True;
-                        break
-            if triple_quote_found:
-                continue
-        else:
-            # Inside triple-quoted string
-            result.append( line );
-            if in_triple in line:
-                # Closing triple quote found
-                in_triple = None;
-            i += 1;
-            continue
-        
-        # Skip comments
-        if stripped.startswith( '#' ):
-            result.append( line );
-            i += 1;
-            continue
-        
-        # Check for opening brackets at end of line ( multi-line block start )
-        open_brackets = { '(': ')', '[': ']', '{': '}' };
-        found_open = None;
-        open_pos = -1;
-        
-        for bracket in open_brackets:
-            pos = line.rfind( bracket );
-            if pos != -1 and pos > open_pos:
-                # Check if bracket is in a string ( simple check )
-                before = line[ :pos ];
-                single_q = before.count( "'" ) - before.count( "\\'" );
-                double_q = before.count( '"' ) - before.count( '\\"' );
-                if single_q % 2 == 0 and double_q % 2 == 0:
-                    # Check if not already closed on same line
-                    after = line[ pos + 1: ];
-                    if open_brackets[ bracket ] not in after:
-                        found_open = bracket;
-                        open_pos = pos;
-        
-        if found_open:
-            # Multi-line block starting 
-            #indent = line[ :len( line ) - len( line.lstrip() ) ]; 
-            prefix = line[ :open_pos + 1 ];
-            close_bracket = open_brackets[ found_open ];
-            
-            # Collect lines until closing bracket
-            block_lines = [ line[ open_pos + 1: ] ];
-            j = i + 1;
-            found_close = False;
-            
-            while j < len( lines ):
-                next_line = lines[ j ];
-                block_lines.append( next_line );
-                if close_bracket in next_line:
-                    found_close = True;
+import sys
+import argparse
+import tokenize
+import io
+import token
+
+# Keywords that should NOT have a semicolon even if they end a line (directives)
+DIRECTIVE_KEYWORDS = {"pass", "raise", "return", "yield", "break", "continue"}
+
+
+def format_tokens(tokens):
+    """
+    Reconstructs code from tokens with applied formatting rules.
+    """
+    out = []
+    last_lineno = -1
+    last_col = 0
+
+    # Filter out ENCODING
+    tokens = [t for t in tokens if t.type != token.ENCODING]
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        type_ = tok.type
+        string_ = tok.string
+        start = tok.start
+        end = tok.end
+        line = tok.line
+
+        # 1. WHITESPACE PRESERVATION/RECONSTRUCTION
+        pad = ""
+        if start[0] == last_lineno:
+            current_col = start[1]
+            if current_col > last_col:
+                pad = " " * (current_col - last_col)
+        elif start[0] > last_lineno:
+            pad = " " * start[1]
+
+        # 2. SPACE INSIDE BRACKETS RULES
+        if i > 0:
+            prev = tokens[i - 1]
+            if prev.type == token.OP and prev.string in "([{":
+                is_empty = (
+                    (prev.string == "(" and string_ == ")")
+                    or (prev.string == "[" and string_ == "]")
+                    or (prev.string == "{" and string_ == "}")
+                )
+                if not is_empty and not pad and start[0] == last_lineno:
+                    pad = " "
+
+            if type_ == token.OP and string_ in ")]}":
+                is_empty = (
+                    (prev.string == "(" and string_ == ")")
+                    or (prev.string == "[" and string_ == "]")
+                    or (prev.string == "{" and string_ == "}")
+                )
+                if not is_empty and not pad and start[0] == last_lineno:
+                    pad = " "
+
+        out.append(pad)
+        out.append(string_)
+
+        # 3. SEMICOLON INSERTION LOGIC
+        should_add_semi = False
+
+        # Look ahead for "End of Statement" signals
+        j = i + 1
+        next_tok = None
+        comment_found = False
+
+        while j < len(tokens):
+            t = tokens[j]
+            if t.type == token.COMMENT:
+                comment_found = True
+                # We need to see what's AFTER the comment to decide
+                # If after comment is NL -> Continuation (no semi)
+                # If after comment is NEWLINE -> End of Stmt (semi)
+                k = j + 1
+                if k < len(tokens):
+                    after_comment = tokens[k]
+                    if after_comment.type == token.NEWLINE:
+                        next_tok = t  # Treat comment as end of stmt marker effectively
+                        # But wait, next_tok logic below expects NEWLINE type?
+                        # No, we set boolean.
+                        should_add_semi = True
+                    elif after_comment.type == token.NL:
+                        should_add_semi = False  # Continuation
+                        next_tok = t  # Found something
+                break
+
+            if t.type not in (token.NL, token.INDENT, token.DEDENT):
+                next_tok = t
+                break
+            j += 1
+
+        if not comment_found:
+            if next_tok:
+                if next_tok.type in (token.NEWLINE, token.ENDMARKER):
+                    should_add_semi = True
+            else:
+                if type_ != token.ENDMARKER:
+                    should_add_semi = True
+
+        # Exceptions logic modifies the 'should_add_semi' decision
+        if should_add_semi:
+            # 1. Current token is ':', ';', '\', ','
+            if string_ in (":", ";", "\\", ","):
+                should_add_semi = False
+
+            # 2. Current token is INDENT/DEDENT/NEWLINE/NL/COMMENT/ENDMARKER
+            if type_ in (
+                token.INDENT,
+                token.DEDENT,
+                token.NEWLINE,
+                token.NL,
+                token.COMMENT,
+                token.ENDMARKER,
+            ):
+                should_add_semi = False
+
+            # 3. Directive and Decorator exclusion
+            k = i
+            while k >= 0:
+                if tokens[k].type in (token.NEWLINE, token.INDENT, token.DEDENT):
                     break
-                j += 1;
-            
-            if found_close and j > i:
-                # Extract closing line
-                last_line = block_lines[ -1 ];
-                close_pos = last_line.find( close_bracket );
-                suffix = last_line[ close_pos + 1: ].strip();
-                block_lines[ -1 ] = last_line[ :close_pos ];
-                
-                # Check for internal comments
-                has_comment = any( '#' in bl for bl in block_lines[ :-1 ] );
-                
-                if not has_comment:
-                    # Join content
-                    content = ' '.join( bl.strip() for bl in block_lines ).strip();
-                    collapsed = f"{prefix} {content} {close_bracket}";
-                    if suffix:
-                        collapsed += ' ' + suffix;
-                    
-                    # Check length
-                    if len( collapsed ) <= max_len:
-                        result.append( collapsed );
-                        i = j + 1;
-                        continue
-                
-                # Can't collapse - add all original lines
-                result.append( line );
-                for k in range( i + 1, j + 1 ):
-                    if k < len( lines ):
-                        result.append( lines[ k ] );
-                i = j + 1;
-            else:
-                result.append( line );
-                i += 1;
-        else:
-            result.append( line );
-            i += 1;
-    
-    return '\n'.join( result )
+                k -= 1
+            start_idx = k + 1
 
-def check_indentation( lines ):
-    """Check if indentation is correct for block levels and return warnings."""
-    warnings = [];
-    indent_stack = [ 0 ];
-    
-    for line_num, line in enumerate( lines, 1 ):
-        stripped = line.lstrip();
-        if not stripped or stripped.startswith( '#' ):
-            continue
-        
-        # Calculate current indentation (spaces or tabs)
-        indent = len( line ) - len( stripped );
-        
-        # Check if previous line ended with colon (new block)
-        if line_num > 1:
-            prev_stripped = lines[ line_num - 2 ].rstrip();
-            if prev_stripped.endswith( ':' ) or prev_stripped.endswith( ':;' ):
-                expected_indent = indent_stack[ -1 ] + 4;
-                if indent != expected_indent:
-                    warnings.append( f"Line {line_num}: Expected indentation {expected_indent}, got {indent}" );
-                if indent > indent_stack[ -1 ]:
-                    indent_stack.append( indent );
-            elif indent < indent_stack[ -1 ]:
-                # Dedent
-                while indent_stack and indent < indent_stack[ -1 ]:
-                    indent_stack.pop();
-                if indent_stack and indent != indent_stack[ -1 ]:
-                    warnings.append( f"Line {line_num}: Indentation {indent} does not match any outer block level" );
-    
-    return warnings
-
-def add_spaces_inside_brackets( code ):
-    """Add single space after opening and before closing brackets/parens/braces.
-    
-    Uses regex to avoid modifying content inside strings.
-    Example: [1,2] -> [ 1,2 ], print(x) -> print( x ), {a:b} -> { a:b }
-    """
-    
-    # Split code into string and non-string segments
-    # This regex matches strings (single, double, triple-quoted) and captures them
-    # Order matters: check triple-quotes before single quotes
-    string_pattern = r'(  """(?:[^"]|"(?!""))*"""|' + r"'''( ?:[ ^']|'( ?!'' ) )*'''" + r'|"(?:[^"\\ ]|\\. )*"|' + r"'(?:[^'\\ ]|\\. )*')";
-    
-    def add_spaces_to_segment( text ):
-        """Add spaces to brackets in non-string text."""
-        # Add space after opening brackets if not already present
-        # (?<=[\(\[\{]) = lookbehind for opening bracket
-        # (?!\s) = not followed by whitespace
-        # (?![\)\]\}]) = not followed by closing bracket (empty brackets)
-        text = re.sub( r'( ?<=[ \( \[ \{] )( ?!\s )( ?![ \ )\ ]\ } ] )', ' ', text );
-        
-        # Add space before closing brackets if not already present
-        # (?<!\s) = not preceded by whitespace
-        # (?<![\(\[\{]) = not preceded by opening bracket (empty brackets)
-        # (?=[\)\]\}]) = lookahead for closing bracket
-        text = re.sub( r'( ?<!\s )( ?<![ \( \[ \{] )( ?=[ \ )\ ]\ } ] )', ' ', text );
-        
-        return text
-    
-    # Process code: split by strings, add spaces only to non-string parts
-    parts = re.split( string_pattern, code, flags=re.DOTALL );
-    result = [];
-    
-    for i, part in enumerate( parts ):
-        if part is None:
-            continue
-        # Odd indices are captured groups (strings), even indices are non-string code
-        if i % 2 == 0:
-            # Non-string code - add spaces
-            result.append( add_spaces_to_segment( part ) );
-        else:
-            # String literal - preserve as-is
-            result.append( part );
-    
-    return ''.join( result )
-
-def remove_invalid_semicolons( code ):
-    """Remove semicolons that appear in invalid syntax positions.
-    
-    ONLY removes semicolons that are inside bracket expressions [],{},().
-    Preserves semicolons in strings, at end of lines, and between statements.
-    
-    Examples:
-        Valid (preserved):   x = 5; y = 10;       # Two statements
-        Valid (preserved):   response.read(); text = decode()  # Two statements
-        Invalid (removed):   [ 'a'; 'b' ]        # Inside list literal
-        Invalid (removed):   func( x; y )        # Inside function call
-    """
-    import re;
-    
-    # Pattern to match strings (triple quotes, double quotes, single quotes)
-    string_pattern = r'("""(?:[^"]|"(?!""))*"""|' + r"'''(?:[^']|'(?!''))*'''" + r'|"(?:[^"\\]|\\.)*"|' + r"'(?:[^'\\]|\\.)*')";
-    
-    lines = code.split( '\n' );
-    result_lines = [];
-    bracket_depth = 0; # Track bracket depth ACROSS LINES
-    
-    for line in lines:
-        # Split line into string and non-string segments
-        parts = [];
-        last_end = 0;
-        
-        for match in re.finditer( string_pattern, line ):
-            # Add non-string part before this string
-            if match.start() > last_end:
-                parts.append( ( 'code', line[last_end:match.start()] ) );
-            # Add the string part
-            parts.append( ( 'string', match.group( 0 ) ) );
-            last_end = match.end();
-        
-        # Add remaining non-string part
-        if last_end < len( line ):
-            parts.append( ( 'code', line[last_end:] ) );
-        
-        # Rebuild line, removing semicolons ONLY inside brackets
-        # Bracket depth carries across lines AND across parts within a line
-        line_result = [];
-        
-        for part_type, part_text in parts:
-            if part_type == 'string':
-                # It's a string - preserve it exactly
-                line_result.append( part_text );
-            else:
-                # Track bracket depth and remove semicolons only inside brackets
-                result = [];
-                
-                for i, char in enumerate( part_text ):
-                    if char in '([{':
-                        bracket_depth += 1;
-                        result.append( char );
-                    elif char in ')]}':
-                        bracket_depth -= 1;
-                        result.append( char );
-                    elif char == ';':
-                        # Only keep semicolon if we're NOT inside brackets
-                        if bracket_depth == 0:
-                            result.append( char );
-                        # else: skip it (remove it)
-                    else:
-                        result.append( char );
-                
-                line_result.append( ''.join( result ) );
-        
-        result_lines.append( ''.join( line_result ) );
-    
-    return '\n'.join( result_lines );
-
-def remove_semicolons_from_comments( code ):
-    """Remove semicolons from comments (both inline and full-line comments).
-    
-    Preserves semicolons inside strings but removes them from:
-    - Full-line comments starting with #
-    - Inline comments (# comment at end of code line)
-    """
-    lines = code.split( '\n' );
-    result = [];
-    in_triple_quote = None;
-    
-    for line in lines:
-        stripped = line.strip();
-        
-        # Track triple-quoted strings
-        if not in_triple_quote:
-            # Check for triple quote start
-            for quote in [ '"""', "'''" ]:
-                if quote in stripped:
-                    count = stripped.count( quote );
-                    if count == 1:
-                        # Opening triple quote
-                        in_triple_quote = quote;
-                        result.append( line );
-                        break;
-                    elif count == 2:
-                        # Triple quote opens and closes on same line
-                        result.append( line );
-                        break;
-            else:
-                # Not in triple quote - process comments
-                if stripped.startswith( '#' ):
-                    # Full-line comment - remove semicolons
-                    result.append( line.replace( ';', '' ) );
-                elif '#' in line:
-                    # Has inline comment - find it and remove semicolons from comment part only
-                    # Find # that's not in a string
-                    in_string = False;
-                    string_char = None;
-                    comment_pos = -1;
-                    
-                    for i, char in enumerate( line ):
-                        if not in_string:
-                            if char in [ '"', "'" ]:
-                                if i == 0 or line[i-1] != '\\':
-                                    in_string = True;
-                                    string_char = char;
-                            elif char == '#':
-                                comment_pos = i;
-                                break;
-                        else:
-                            if char == string_char:
-                                if i == 0 or line[i-1] != '\\':
-                                    in_string = False;
-                                    string_char = None;
-                    
-                    if comment_pos > 0:
-                        # Has inline comment
-                        code_part = line[:comment_pos];
-                        comment_part = line[comment_pos:];
-                        # Remove semicolons from comment part only
-                        result.append( code_part + comment_part.replace( ';', '' ) );
-                    else:
-                        result.append( line );
-                else:
-                    # No comment
-                    result.append( line );
-        else:
-            # Inside triple-quoted string - preserve everything
-            result.append( line );
-            if in_triple_quote in line:
-                # Closing triple quote found
-                in_triple_quote = None;
-    
-    return '\n'.join( result );
-
-def collapse_blank_lines( code ):
-    """Collapse multiple consecutive blank lines to maximum of one blank line.
-    
-    Preserves blank lines inside strings (triple-quoted), but collapses
-    excessive blank lines in regular code.
-    """
-    lines = code.split( '\n' );
-    result = [];
-    in_triple = None;
-    consecutive_blanks = 0;
-    
-    for line in lines:
-        stripped = line.strip();
-        
-        # Track triple-quoted strings
-        if not in_triple:
-            # Check for triple quote start
-            for quote in [ '"""', "'''" ]:
-                if quote in stripped:
-                    count = stripped.count( quote );
-                    if count == 1:
-                        # Opening triple quote
-                        in_triple = quote;
-                        result.append( line );
-                        consecutive_blanks = 0;
-                        break
-                    elif count == 2:
-                        # Triple quote opens and closes on same line
-                        result.append( line );
-                        consecutive_blanks = 0;
-                        break
-            else:
-                # Not a triple quote line
-                if not stripped:
-                    # Blank line
-                    consecutive_blanks += 1;
-                    # Only keep first blank line
-                    if consecutive_blanks == 1:
-                        result.append( line );
-                else:
-                    # Non-blank line
-                    consecutive_blanks = 0;
-                    result.append( line );
-        else:
-            # Inside triple-quoted string - preserve everything
-            result.append( line );
-            if in_triple in line:
-                # Closing triple quote found
-                in_triple = None;
-                consecutive_blanks = 0;
-    
-    return '\n'.join( result )
-
-def remove_useless_fstrings( code ):
-    """Remove f prefix from strings that don't contain placeholders {}."""
-    # Match "..." or '...' strings and check if they contain {}
-    import re;
-    
-    def replace_fstring( match ):
-        quote_char = match.group( 1 ); # Single or double quote
-        content = match.group( 2 ); # String content
-        
-        # Check if content has placeholders
-        if '{ ' in content and ' }' in content:
-            # Keep f-string
-            return match.group( 0 )
-        else:
-            # Remove f prefix
-            return f"{ quote_char }{ content }{ quote_char }"
-    
-    # Pattern to match "..." or '...' (handling escaped quotes)
-    # Match f followed by quote, then content, then closing quote
-    pattern = r'\bf( [ "\'])(((?!(?<!\\)\1).)*?)\1';
-    
-    result = re.sub( pattern, replace_fstring, code );
-    return result
-
-def add_semicolons( code ):
-    """Add semicolons to every line of Python code ( excluding blank lines, comments, and docstrings )."""
-    lines = code.split( '\n' );
-    result = [];
-    in_multiline_comment = False;
-    multiline_quote = None;
-    bracket_depth = 0; # Track if we're inside brackets
-
-    for line_idx, line in enumerate( lines ):
-        stripped = line.rstrip();
-        lstripped = stripped.lstrip();
-        
-        # Count ALL brackets on this line (not just spaced ones)
-        # We need to count outside of strings only
-        open_count = 0;
-        close_count = 0;
-        in_str = False;
-        str_char = None;
-        for i, ch in enumerate( stripped ):
-            if not in_str:
-                if ch in [ '"', "'" ]:
-                    if i == 0 or stripped[i-1] != '\\':
-                        in_str = True;
-                        str_char = ch;
-                elif ch in [ '(', '[', '{' ]:
-                    open_count += 1;
-                elif ch in [ ')', ']', '}' ]:
-                    close_count += 1;
-            else:
-                if ch == str_char:
-                    if i == 0 or stripped[i-1] != '\\':
-                        in_str = False;
-                        str_char = None;
-        
-        # Skip empty lines
-        if not stripped:
-            result.append( line );
-            continue
-
-        # Check for multi-line comment start/end (""" or ''' )
-        if not in_multiline_comment:
-            # Check if line contains triple quotes (could be at start or after assignment)
-            for quote in [ '"""', "'''" ]:
-                if quote in stripped:
-                    # Count occurrences to determine if it opens/closes on same line
-                    count = stripped.count( quote );
-                    if count == 1:
-                        # Opening triple quote (may be standalone or at end of line like sql = """)
-                        multiline_quote = quote;
-                        in_multiline_comment = True;
-                        result.append( line );
-                        break;
-                    elif count == 2:
-                        # Triple quote opens and closes on same line (e.g., x = """text""")
-                        # Don't set in_multiline_comment, just append and add semicolon normally
-                        break;
-            else:
-                # No triple quotes found, continue to normal processing below
-                pass;
-            
-            # If we just entered a multiline comment, skip the rest of processing
-            if in_multiline_comment:
-                continue;
-        else:
-            # Already inside multi-line comment - preserve everything
-            result.append( line );
-            if multiline_quote in stripped:
-                in_multiline_comment = False;
-            continue
-
-        # Skip single-line comments
-        if lstripped.startswith( '#' ):
-            result.append( line );
-            continue
-        
-        # Skip decorators ( lines starting with @ )
-        if lstripped.startswith( '@' ):
-            # Remove semicolon if it exists on decorator
-            if stripped.endswith( ';' ):
-                stripped = stripped[ :-1 ];
-            result.append( stripped );
-            continue
-
-        # Remove :; pattern if it exists at the end
-        if stripped.endswith( ':;' ):
-            stripped = stripped[ :-1 ];
-
-        # If line ends with opening bracket, update depth and don't add semicolon
-        if stripped.endswith( ( '( ', '[ ', '{ ' ) ):
-            bracket_depth += open_count - close_count
-            result.append( stripped )
-            continue
-        
-        # Remove semicolon if it appears right after opening bracket (syntax error)
-        if '( ' in stripped or '[ ' in stripped or '{ ' in stripped:
-            stripped = stripped.replace( '( ', '( ' ).replace( '[ ', '[ ' ).replace( '{ ', '{ ' )
-        
-        # Check if we're currently inside brackets BEFORE updating depth
-        was_inside_brackets = bracket_depth > 0
-        
-        # Update bracket depth
-        bracket_depth += open_count - close_count
-        
-        # Also check if this line has unbalanced brackets (single-line expression with unclosed brackets)
-        # This catches list comprehensions like [ x for x in list ] on one line
-        has_unbalanced_brackets = ( bracket_depth > 0 )
-        
-        # If we were inside brackets or line ends with opening bracket, don't add semicolon
-        if was_inside_brackets or has_unbalanced_brackets or stripped.endswith( ( '( ', '[ ', '{ ' ) ):
-            # Remove trailing semicolon if it exists (shouldn't be there )
-            if stripped.endswith( ';' ) and not stripped.endswith( ':;' ):
-                stripped = stripped[ :-1 ]
-            result.append( stripped )
-            continue
-        
-        # Check if line has inline comment ( code followed by # )
-        # Need to find # that's not inside a string
-        # Match strings and find # outside of them
-        in_string = False
-        string_char = None
-        comment_pos = -1
-        
-        for i, char in enumerate( stripped ):
-            if not in_string:
-                if char in [ '"', "'" ]:
-                    # Check if not escaped
-                    if i == 0 or stripped[i-1] != '\\':
-                        in_string = True
-                        string_char = char
-                elif char == '#':
-                    comment_pos = i
+            idx_scan = start_idx
+            first_sig_token = None
+            while idx_scan <= i:
+                t = tokens[idx_scan]
+                if t.type not in (token.NL, token.COMMENT):
+                    first_sig_token = t
                     break
-            else:
-                if char == string_char:
-                    # Check if not escaped
-                    if i == 0 or stripped[i-1] != '\\':
-                        in_string = False
-                        string_char = None
-        
-        if comment_pos > 0:
-            # Has inline comment - add semicolon before the comment unless it's a raise statement
-            code_part = stripped[ :comment_pos ].rstrip()
-            comment_part = stripped[ comment_pos: ]
-            
-            # Special case: never add semicolon to raise statements, even with comments
-            if code_part.lstrip().startswith( 'raise' ):
-                result.append( code_part + ' ' + comment_part )
-                continue
-            
-            # Check if code part already ends with semicolon or other punctuation
-            if code_part.endswith( ( ';', ':', ',', '.', '\\', ' or', ' and' ) ):
-                result.append( stripped )
-            else:
-                result.append( code_part + '; ' + comment_part )
-            continue
-        
-        # Check if line ends with control flow keywords that shouldn't have semicolons
-        # These are statements that change flow: raise, return, break, continue, pass, yield
-        control_keywords = [ 'raise', 'return', 'break', 'continue', 'pass', 'yield' ]
-        ends_with_control = False
-        for keyword in control_keywords:
-            # Check if line ends with keyword (possibly followed by whitespace)
-            if lstripped.startswith( keyword + ' ' ) or lstripped == keyword:
-                # Make sure it's actually the keyword and not part of a larger identifier
-                # Check the code part ( before any comment )
-                code_only = stripped.split( '#' )[ 0 ].rstrip()
-                if code_only.endswith( keyword ) or keyword + ' ' in code_only or keyword + '(' in code_only:
-                    ends_with_control = True
-                    break
-        
-        if ends_with_control:
-            result.append( stripped )
-            continue
-        
-        # If line already ends with certain punctuation or boolean operators, keep it
-        # Note: ) ] } are NOT in this list because complete statements like print() should get semicolons
-        if stripped.endswith( ( ';', ':', ',', '.', '\\', ' or', ' and' ) ):
-            result.append( stripped )
-            continue
-        
-        # Special case: if line ends with ) and next line is indented more, don't add semicolon
-        # (This is a function/class definition followed by a block)
-        if stripped.endswith( ' )' ):
-            # Check if there's a next line
-            if line_idx + 1 < len( lines ):
-                next_line = lines[ line_idx + 1 ]
-                # Get current and next line indentation
-                current_indent = len( line ) - len( line.lstrip() )
-                next_indent = len( next_line ) - len( next_line.lstrip() )
-                # If next line is indented more ( and not empty/comment ), don't add semicolon
-                next_stripped = next_line.strip()
-                if next_stripped and not next_stripped.startswith( '#' ) and next_indent > current_indent:
-                    result.append( stripped )
-                    continue
+                idx_scan += 1
 
-        # Add semicolon to code lines
-        result.append( stripped + ';' )
+            if first_sig_token:
+                if (
+                    first_sig_token.type == token.NAME
+                    and first_sig_token.string in DIRECTIVE_KEYWORDS
+                ):
+                    should_add_semi = False
+                elif first_sig_token.type == token.OP and first_sig_token.string == "@":
+                    should_add_semi = False
 
-    return '\n'.join( result )
+        if should_add_semi:
+            out.append(";")
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser( description='Custom Python formatter' )
-    parser.add_argument( 'files', nargs='*', help='Files to format' )
-    parser.add_argument( '--in-place', '-i', action='store_true', help='Format files in place' )
+        last_lineno = end[0]
+        last_col = end[1]
+
+        i += 1
+
+    return "".join(out)
+
+
+def process_file(filepath, in_place):
+    try:
+        content = ""
+        if filepath == "-":
+            content = sys.stdin.read()
+        else:
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+
+        b_content = content.encode("utf-8")
+        bio = io.BytesIO(b_content)
+
+        try:
+            tokens = list(tokenize.tokenize(bio.readline))
+        except tokenize.TokenError as e:
+            sys.stderr.write(f"⚠️  Tokenization error in {filepath}: {e}\n")
+            return
+
+        formatted = format_tokens(tokens)
+
+        if in_place and filepath != "-":
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(formatted)
+        else:
+            print(formatted)
+
+    except Exception as e:
+        sys.stderr.write(f"Error processing {filepath}: {e}\n")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("files", nargs="*", help="Files to format")
+    parser.add_argument("--in-place", "-i", action="store_true")
     args = parser.parse_args()
-    
+
     if args.files:
-        # Format files
-        for filepath in args.files:
-            try:
-                with open( filepath, 'r' ) as f:
-                    code = f.read()
-            except Exception as e:
-                print( f"Error reading { filepath }: { e }", file=sys.stderr )
-                sys.exit( 1 )
-            
-            # Apply formatting pipeline
-            formatted = remove_useless_fstrings( code );
-            formatted = collapse_multiline_blocks( formatted );  # Collapse BEFORE adding semicolons
-            formatted = add_spaces_inside_brackets( formatted );
-            formatted = add_semicolons( formatted );
-            formatted = remove_invalid_semicolons( formatted );  # Remove invalid semicolons AFTER adding them
-            formatted = remove_semicolons_from_comments( formatted );  # Remove semicolons from comments
-            formatted = collapse_blank_lines( formatted );
-            
-            # Check indentation and show warnings
-            warnings = check_indentation( formatted.split( '\n' ) )
-            if warnings:
-                for warning in warnings:
-                    print( f"⚠️  { filepath }: { warning }", file=sys.stderr )
-            
-            if args.in_place:
-                try:
-                    with open( filepath, 'w' ) as f:
-                        f.write( formatted )
-                except Exception as e:
-                    print( f"Error writing { filepath }: { e }", file=sys.stderr )
-                    sys.exit( 1 )
-            else:
-                sys.stdout.write( formatted )
+        for f in args.files:
+            process_file(f, args.in_place)
     else:
-        # Read from stdin
-        code = sys.stdin.read()
-        
-        # Apply formatting pipeline
-        formatted = remove_useless_fstrings( code );
-        formatted = collapse_multiline_blocks( formatted );  # Collapse BEFORE adding semicolons
-        formatted = add_spaces_inside_brackets( formatted );
-        formatted = add_semicolons( formatted );
-        formatted = remove_invalid_semicolons( formatted );  # Remove invalid semicolons AFTER adding them
-        formatted = remove_semicolons_from_comments( formatted );  # Remove semicolons from comments
-        formatted = collapse_blank_lines( formatted );
-        
-        # Check indentation and show warnings
-        warnings = check_indentation( formatted.split( '\n' ) )
-        if warnings:
-            for warning in warnings:
-                print( f"⚠️  { warning }", file=sys.stderr )
-        
-        sys.stdout.write( formatted )
+        process_file("-", False)
