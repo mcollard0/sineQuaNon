@@ -1,17 +1,115 @@
 #!/bin/bash
 #
-# Fast Drive Test for nvme2 using native tools
+# Fast Drive Test for NVMe drives using native tools
 # Fills with zeros, verifies, recreates filesystem
 # WARNING: DESTROYS ALL DATA on the device!
+#
+# Usage: drive_test_nvme.sh <device|UUID> [mount_point]
+#   device: /dev/nvme2n1, nvme2n1, or UUID=xxxx-xxxx
+#   mount_point: optional, will prompt if not provided
 #
 
 set -e;  # Exit on error;
 
-DEVICE="/dev/nvme2n1";
-PARTITION="/dev/nvme2n1p1";
-MOUNT_POINT="/Media/3";
 BLOCK_SIZE="128M";  # 128MB blocks for optimal NVMe performance;
-REPORT_FILE="drive_test_report_$(date +%Y%m%d_%H%M%S).txt";
+
+# Usage function;
+show_usage() {
+    echo "Usage: $0 <device|UUID> [mount_point]";
+    echo "";
+    echo "Examples:";
+    echo "  $0 /dev/nvme2n1 /Media/3";
+    echo "  $0 nvme2n1 /Media/3";
+    echo "  $0 UUID=1234-5678-90ab /mnt/test";
+    echo "";
+    echo "Available block devices:";
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,UUID,MOUNTPOINT | grep -E "(NAME|nvme|sd)";
+    exit 1;
+}
+
+# Parse command-line arguments;
+if [ $# -lt 1 ]; then
+    echo "Error: Device identifier required";
+    echo "";
+    show_usage;
+fi
+
+DEVICE_ARG="$1";
+MOUNT_POINT="${2:-}";
+
+# Resolve device from argument;
+resolve_device() {
+    local arg="$1";
+    
+    # Check if it's a UUID;
+    if [[ "$arg" =~ ^UUID= ]]; then
+        local uuid="${arg#UUID=}";
+        local dev=$(blkid -U "$uuid" 2>/dev/null);
+        if [ -z "$dev" ]; then
+            echo "Error: UUID $uuid not found" >&2;
+            return 1;
+        fi
+        echo "$dev";
+        return 0;
+    fi
+    
+    # Check if it's a full path;
+    if [[ "$arg" =~ ^/dev/ ]]; then
+        if [ -b "$arg" ]; then
+            echo "$arg";
+            return 0;
+        else
+            echo "Error: $arg is not a block device" >&2;
+            return 1;
+        fi
+    fi
+    
+    # Assume it's a device name without /dev/;
+    if [ -b "/dev/$arg" ]; then
+        echo "/dev/$arg";
+        return 0;
+    fi
+    
+    echo "Error: Could not resolve device: $arg" >&2;
+    return 1;
+}
+
+DEVICE=$(resolve_device "$DEVICE_ARG");
+if [ $? -ne 0 ]; then
+    echo "";
+    show_usage;
+fi
+
+# Determine partition name;
+if [[ "$DEVICE" =~ nvme ]]; then
+    PARTITION="${DEVICE}p1";
+else
+    PARTITION="${DEVICE}1";
+fi
+
+# Get current mount point if device is mounted;
+CURRENT_MOUNT=$(lsblk -no MOUNTPOINT "$PARTITION" 2>/dev/null | head -1);
+
+# If mount point not provided, try to use current or prompt;
+if [ -z "$MOUNT_POINT" ]; then
+    if [ -n "$CURRENT_MOUNT" ]; then
+        echo "Device is currently mounted at: $CURRENT_MOUNT";
+        read -p "Use this mount point? [Y/n]: " use_current;
+        if [[ ! "$use_current" =~ ^[Nn] ]]; then
+            MOUNT_POINT="$CURRENT_MOUNT";
+        fi
+    fi
+    
+    if [ -z "$MOUNT_POINT" ]; then
+        read -p "Enter mount point for device: " MOUNT_POINT;
+        if [ -z "$MOUNT_POINT" ]; then
+            echo "Error: Mount point required";
+            exit 1;
+        fi
+    fi
+fi
+
+REPORT_FILE="drive_test_report_$(basename "$DEVICE")_$(date +%Y%m%d_%H%M%S).txt";
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$REPORT_FILE";
@@ -32,11 +130,12 @@ human_size() {
 }
 
 log_divider;
-log "Drive Test Program - nvme2 (Fast Version)";
+log "Drive Test Program - $(basename "$DEVICE")";
 log_divider;
 log "Device: $DEVICE";
 log "Partition: $PARTITION";
 log "Mount point: $MOUNT_POINT";
+log "Block size: $BLOCK_SIZE";
 log "";
 
 # Confirmation;
