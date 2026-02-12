@@ -166,7 +166,7 @@ def get_extension_name_from_github_url( github_url ):
     
     return None;
 
-def clone_extension( github_url, extensions_dir ):
+def clone_extension( github_url, extensions_dir, force=False ):
     """Clone the extension repository into the extensions directory."""
     extension_name = get_extension_name_from_github_url( github_url );
     
@@ -178,9 +178,8 @@ def clone_extension( github_url, extensions_dir ):
     
     # Check if already exists
     if os.path.isdir( target_dir ):
-        print( f"⚠️  Extension directory already exists: {target_dir}" );
-        response = input( "Do you want to remove and re-clone? (y/N): " ).strip().lower();
-        if response == "y":
+        if force:
+            print( f"🔄 Extension directory already exists, removing: {target_dir}" );
             try:
                 import shutil;
                 shutil.rmtree( target_dir );
@@ -189,8 +188,19 @@ def clone_extension( github_url, extensions_dir ):
                 print( f"❌ Failed to remove existing directory: {e}" );
                 return None;
         else:
-            print( "❌ Installation cancelled" );
-            return None;
+            print( f"⚠️  Extension directory already exists: {target_dir}" );
+            response = input( "Do you want to remove and re-clone? (y/N): " ).strip().lower();
+            if response == "y":
+                try:
+                    import shutil;
+                    shutil.rmtree( target_dir );
+                    print( f"🗑️  Removed existing directory" );
+                except Exception as e:
+                    print( f"❌ Failed to remove existing directory: {e}" );
+                    return None;
+            else:
+                print( "❌ Installation cancelled" );
+                return None;
     
     # Clone the repository
     print( f"📥 Cloning extension from: {github_url}" );
@@ -246,9 +256,29 @@ def build_extension( target_dir ):
         print( f"ℹ️  Skipping build step" );
         return True;
     
+    # Check if node is available
+    try:
+        result = subprocess.run( ["node", "--version"], capture_output=True, check=True, text=True );
+        node_version = result.stdout.strip();
+        print( f"✅ Node.js found: {node_version}" );
+    except ( subprocess.CalledProcessError, FileNotFoundError ):
+        print( f"❌ Node.js is not installed. Cannot build extension." );
+        print( f"" );
+        print( f"Please install Node.js:" );
+        print( f"  sudo pacman -S nodejs npm    # CachyOS/Arch" );
+        print( f"  sudo apt install nodejs npm  # Debian/Ubuntu" );
+        print( f"" );
+        print( f"After installing Node.js and npm, run:" );
+        print( f"  cd {target_dir}" );
+        print( f"  npm install" );
+        print( f"  npm run package  # or npm run compile" );
+        return False;
+    
     # Check if npm is available
     try:
-        subprocess.run( ["npm", "--version"], capture_output=True, check=True );
+        result = subprocess.run( ["npm", "--version"], capture_output=True, check=True, text=True );
+        npm_version = result.stdout.strip();
+        print( f"✅ npm found: {npm_version}" );
     except ( subprocess.CalledProcessError, FileNotFoundError ):
         print( f"❌ npm is not installed. Cannot build extension." );
         print( f"" );
@@ -301,12 +331,28 @@ def build_extension( target_dir ):
                 cwd=target_dir,
                 capture_output=True,
                 text=True,
-                check=True
+                check=False  # Don't raise on non-zero exit, check output instead
             );
-            print( f"✅ Extension built successfully using '{cmd[2]}'" );
-            return True;
-        except subprocess.CalledProcessError as e:
-            print( f"⚠️  '{cmd[2]}' failed, trying next..." );
+            
+            # Check if the build output exists (dist/ or out/ directory with main file)
+            if "dist/" in main_file or "out/" in main_file:
+                build_dir = "dist" if "dist/" in main_file else "out";
+                main_file_path = os.path.join( target_dir, main_file.lstrip( "./" ) );
+                
+                if os.path.isfile( main_file_path ):
+                    print( f"✅ Extension built successfully using '{cmd[2]}'" );
+                    if result.returncode != 0:
+                        print( f"⚠️  Build completed with warnings (exit code {result.returncode})" );
+                    return True;
+            
+            # If exit code is 0 but file doesn't exist yet, try next command
+            if result.returncode == 0:
+                print( f"⚠️  '{cmd[2]}' succeeded but output file not found, trying next..." );
+            else:
+                print( f"⚠️  '{cmd[2]}' failed (exit code {result.returncode}), trying next..." );
+            continue;
+        except Exception as e:
+            print( f"⚠️  '{cmd[2]}' error: {e}, trying next..." );
             continue;
     
     print( f"❌ All build commands failed" );
@@ -344,14 +390,19 @@ def validate_extension( extensions_dir, github_url ):
 
 def main():
     if len( sys.argv ) < 2:
-        print( "Usage: python3 vscode_install_extension_from_url.py <url>" );
+        print( "Usage: python3 vscode_install_extension_from_url.py <url> [--force]" );
         print( "" );
         print( "Examples:" );
         print( "  python3 vscode_install_extension_from_url.py https://marketplace.visualstudio.com/items?itemName=eliostruyf.vscode-remote-control" );
         print( "  python3 vscode_install_extension_from_url.py https://github.com/estruyf/vscode-remote-control" );
+        print( "  python3 vscode_install_extension_from_url.py https://github.com/estruyf/vscode-remote-control --force" );
+        print( "" );
+        print( "Options:" );
+        print( "  --force    Automatically overwrite existing extension without prompting" );
         sys.exit( 1 );
     
     url = sys.argv[1];
+    force = "--force" in sys.argv;
     
     print( "🔍 Searching for editor installation..." );
     base_path = find_editor_installation();
@@ -387,7 +438,7 @@ def main():
         sys.exit( 1 );
     
     # Clone the extension
-    target_dir = clone_extension( github_url, extensions_dir );
+    target_dir = clone_extension( github_url, extensions_dir, force );
     
     if not target_dir:
         sys.exit( 1 );
